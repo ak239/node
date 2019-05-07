@@ -2,6 +2,7 @@
 
 #include "inspector/main_thread_interface.h"
 #include "inspector/node_string.h"
+#include "inspector/runtime_agent.h"
 #include "inspector/tracing_agent.h"
 #include "inspector/worker_agent.h"
 #include "inspector/worker_inspector.h"
@@ -228,6 +229,8 @@ class ChannelImpl final : public v8_inspector::V8Inspector::Channel,
     tracing_agent_->Wire(node_dispatcher_.get());
     worker_agent_ = std::make_unique<protocol::WorkerAgent>(worker_manager);
     worker_agent_->Wire(node_dispatcher_.get());
+    runtime_agent_.reset(new protocol::RuntimeAgent(env));
+    runtime_agent_->Wire(node_dispatcher_.get());
   }
 
   ~ChannelImpl() override {
@@ -235,6 +238,8 @@ class ChannelImpl final : public v8_inspector::V8Inspector::Channel,
     tracing_agent_.reset();  // Dispose before the dispatchers
     worker_agent_->disable();
     worker_agent_.reset();  // Dispose before the dispatchers
+    runtime_agent_->disable();
+    runtime_agent_.reset();  // Dispose before the dispatchers
   }
 
   std::string dispatchProtocolMessage(const StringView& message) {
@@ -262,6 +267,10 @@ class ChannelImpl final : public v8_inspector::V8Inspector::Channel,
 
   bool preventShutdown() {
     return prevent_shutdown_;
+  }
+
+  bool reportWaitingForDebuggerToDisconnect() {
+    return runtime_agent_->reportWaitingForDebuggerToDisconnect();
   }
 
  private:
@@ -303,6 +312,7 @@ class ChannelImpl final : public v8_inspector::V8Inspector::Channel,
     DCHECK(false);
   }
 
+  std::unique_ptr<protocol::RuntimeAgent> runtime_agent_;
   std::unique_ptr<protocol::TracingAgent> tracing_agent_;
   std::unique_ptr<protocol::WorkerAgent> worker_agent_;
   std::unique_ptr<InspectorSessionDelegate> delegate_;
@@ -610,6 +620,14 @@ class NodeInspectorClient : public V8InspectorClient {
     return false;
   }
 
+  bool reportWaitingForDebuggerToDisconnect() {
+    for (const auto& id_channel : channels_) {
+      if (id_channel.second->reportWaitingForDebuggerToDisconnect())
+        return true;
+    }
+    return false;
+  }
+
   std::shared_ptr<MainThreadHandle> getThreadHandle() {
     if (interface_ == nullptr) {
       interface_.reset(new MainThreadInterface(
@@ -779,7 +797,8 @@ void Agent::WaitForDisconnect() {
   }
   // TODO(addaleax): Maybe this should use an at-exit hook for the Environment
   // or something similar?
-  client_->contextDestroyed(parent_env_->context());
+  if (!client_->reportWaitingForDebuggerToDisconnect())
+    client_->contextDestroyed(parent_env_->context());
   if (io_ != nullptr) {
     io_->StopAcceptingNewConnections();
     client_->waitForIoShutdown();
